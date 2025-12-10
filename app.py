@@ -2,16 +2,13 @@ from openai import OpenAI
 import requests
 import json
 from datetime import datetime
-import random
 import os
-import threading
-import time
-import re
 from dotenv import load_dotenv
+from flask import Flask, request, jsonify
 
 load_dotenv()
 
-LAUNCH_TIMESTAMP = int(time.time())
+LAUNCH_TIMESTAMP = int(datetime.now().timestamp())
 
 WHATSAPP_TOKEN = "dT0r8H22LG6eFrF2A2dgKBaqAU5QcHIR"
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "").strip()
@@ -200,13 +197,15 @@ SYSTEM_PROMPT = f"""Сен "Turan Fast food" фастфуд мейрамхана
 ✅ 99% сатылым!
 """
 
-client = OpenAI(api_key=PERPLEXITY_API_KEY, base_url="https://api.perplexity.ai")
+# Flask приложение
+app = Flask(__name__)
 
+# Хранилище для разговоров
 conversations = {}
 processed_message_ids = set()
-processed_lock = threading.Lock()
-poller_start_time = LAUNCH_TIMESTAMP
-POLL_INTERVAL_SECONDS = 2
+
+# OpenAI клиент
+client = OpenAI(api_key=PERPLEXITY_API_KEY, base_url="https://api.perplexity.ai")
 
 def ensure_conversation(user_phone):
     if user_phone not in conversations:
@@ -225,22 +224,10 @@ def remember_user_message_only(user_phone, user_message):
         conv["messages"] = conv["messages"][-20:]
     return conv
 
-def mark_message_processed(msg_id):
-    if not msg_id:
-        return False
-    with processed_lock:
-        if msg_id in processed_message_ids:
-            return False
-        processed_message_ids.add(msg_id)
-        if len(processed_message_ids) > 2000:
-            processed_message_ids.clear()
-    return True
-
 def should_send_menu(text):
     text_lower = text.lower()
     if any(word in text_lower for word in MENU_KEYWORDS):
         return True
-    # "не знаю" + "что" + "заказать" разбросанные по фразе
     if "не" in text_lower and "зна" in text_lower and "заказ" in text_lower:
         return True
     return False
@@ -254,25 +241,6 @@ def send_menu(user_phone):
             print(f"✅ Меню отправлено {user_phone}")
         else:
             send_message(user_phone, "⚠️ Мәзір суретін жіберу мүмкін болмады. Бургелерді мәтінмен айтып берейін бе?")
-
-def handle_incoming_message(user_phone, user_message):
-    """Обработать входящее сообщение"""
-    print(f"📩 Новое сообщение от {user_phone}: {user_message}")
-    
-    # Проверяем, нужно ли отправить меню
-    if should_send_menu(user_message):
-        send_menu(user_phone)
-        return
-    
-    # Отправляем индикатор набора
-    send_typing(user_phone)
-    
-    # Получаем ответ от AI
-    ai_response = get_ai_response(user_phone, user_message)
-    
-    # Отправляем ответ
-    send_message(user_phone, ai_response)
-    print(f"✅ Ответ отправлен {user_phone}")
 
 # ======================== WHATSAPP ========================
 def send_message(to, text):
@@ -344,62 +312,82 @@ def get_ai_response(user_phone, user_message):
         print(f"[ERROR] AI: {e}")
         return "Кешіріңіз, техникалық ақау. Қайталаңыз!"
 
-# ======================== POLLING ========================
-def poll_whapi_messages():
-    """Опрашивать Whapi.cloud на новые сообщения"""
-    global poller_start_time
-    
-    url = "https://gate.whapi.cloud/messages/list"
-    params = {"token": WHATSAPP_TOKEN, "count": 20}
-    
-    while True:
-        try:
-            response = requests.get(url, params=params, timeout=10)
+# ======================== WEBHOOK ENDPOINTS ========================
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Обработка входящих webhook от Whapi"""
+    try:
+        data = request.get_json()
+        
+        # Логируем полученные данные
+        print(f"📨 Webhook получен: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        # Извлекаем данные сообщения
+        messages = data.get('messages', [])
+        
+        for msg in messages:
+            msg_id = msg.get('id')
             
-            if response.status_code == 200:
-                data = response.json()
-                messages = data.get("messages", [])
+            # Проверяем, не обработали ли уже это сообщение
+            if msg_id in processed_message_ids:
+                continue
+            
+            processed_message_ids.add(msg_id)
+            
+            # Пропускаем исходящие сообщения
+            if msg.get('from_me', False):
+                continue
+            
+            # Получаем данные сообщения
+            msg_type = msg.get('type', '')
+            user_phone = msg.get('from', '') or msg.get('chat_id', '')
+            
+            if msg_type == 'text':
+                user_message = msg.get('text', {}).get('body', '')
                 
-                for msg in reversed(messages):  # Обрабатываем от старых к новым
-                    msg_id = msg.get("id")
-                    msg_timestamp = msg.get("timestamp", 0)
+                if user_message and user_phone:
+                    print(f"📩 Новое сообщение от {user_phone}: {user_message}")
                     
-                    # Пропускаем старые сообщения (до запуска бота)
-                    if msg_timestamp < poller_start_time:
-                        continue
-                    
-                    # Пропускаем уже обработанные
-                    if not mark_message_processed(msg_id):
-                        continue
-                    
-                    # Пропускаем исходящие сообщения
-                    if msg.get("from_me", False):
-                        continue
-                    
-                    # Получаем текст сообщения
-                    msg_type = msg.get("type", "")
-                    user_phone = msg.get("chat_id", "")
-                    
-                    if msg_type == "text":
-                        user_message = msg.get("text", {}).get("body", "")
-                        if user_message and user_phone:
-                            handle_incoming_message(user_phone, user_message)
+                    # Проверяем, нужно ли отправить меню
+                    if should_send_menu(user_message):
+                        send_menu(user_phone)
                     else:
-                        print(f"⚠️ Неподдерживаемый тип сообщения: {msg_type}")
-            
+                        # Отправляем индикатор набора
+                        send_typing(user_phone)
+                        
+                        # Получаем ответ от AI
+                        ai_response = get_ai_response(user_phone, user_message)
+                        
+                        # Отправляем ответ
+                        send_message(user_phone, ai_response)
+                        print(f"✅ Ответ отправлен {user_phone}")
             else:
-                print(f"[ERROR] Whapi polling: {response.status_code}")
+                print(f"⚠️ Неподдерживаемый тип сообщения: {msg_type}")
         
-        except Exception as e:
-            print(f"[ERROR] Polling exception: {e}")
+        return jsonify({"status": "success"}), 200
         
-        # Ждем перед следующим опросом
-        time.sleep(POLL_INTERVAL_SECONDS)
+    except Exception as e:
+        print(f"[ERROR] Webhook processing: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/webhook', methods=['GET'])
+def webhook_verify():
+    """Верификация webhook (если требуется)"""
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Проверка работоспособности"""
+    return jsonify({
+        "status": "running",
+        "timestamp": datetime.now().isoformat(),
+        "active_conversations": len(conversations)
+    }), 200
 
 # ======================== ЗАПУСК ========================
 if __name__ == "__main__":
     print("=" * 70)
-    print("🍔 AI МЕНЕДЖЕР ФАСТ-ФУДА (POLLING MODE) 🍔")
+    print("🍔 AI МЕНЕДЖЕР ФАСТ-ФУДА (WEBHOOK MODE) 🍔")
     print("=" * 70)
     print(f"⏰ Запущен: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📷 Меню фото: {MENU_IMAGE_PATH}")
@@ -407,11 +395,14 @@ if __name__ == "__main__":
     print("=" * 70)
     print("\n📝 ИНСТРУКЦИЯ:")
     print("   1. Убедитесь, что WHATSAPP_TOKEN заполнен")
-    print("   2. Запустите этот скрипт: python app.py")
-    print("   3. Бот сам будет опрашивать Whapi.cloud каждые 2 секунды")
-    print("   4. В консоли будут логи новых сообщений и заказов")
-    print("   5. Airtable НЕ используется - все заказы только через WhatsApp")
-    print("\n🚀 Poller активен! Ожидаем входящие сообщения...\n")
+    print("   2. Настройте webhook в Whapi.cloud:")
+    print("      - URL: http://ваш-сервер:5000/webhook")
+    print("      - События: messages")
+    print("   3. Запустите этот скрипт: python app.py")
+    print("   4. Для локального тестирования используйте ngrok:")
+    print("      ngrok http 5000")
+    print("   5. В консоли будут логи новых сообщений и заказов")
+    print("\n🚀 Сервер запускается на порту 5000...\n")
     
     # Проверяем что меню существует
     if os.path.exists(MENU_IMAGE_PATH):
@@ -422,4 +413,5 @@ if __name__ == "__main__":
     
     print("\n" + "="*70 + "\n")
     
-    poll_whapi_messages()
+    # Запускаем Flask сервер
+    app.run(host='0.0.0.0', port=5000, debug=False)
